@@ -84,14 +84,19 @@ def handler(job):
             print(f"Generating segment {i + 1}/{len(segments)}: {len(seg_text)} chars")
 
             # Call the predict method from cog-dia's predict.py
-            # It returns a cog.Path pointing to a WAV file
+            # Must pass ALL optional params explicitly — cog.Input() defaults
+            # return FieldInfo objects (not None) when called outside Cog's HTTP server.
             seg_seed = seed + i if seed is not None else None
             output_path = predictor.predict(
                 text=seg_text,
+                audio_prompt=None,
+                audio_prompt_text=None,
                 max_new_tokens=max_new_tokens,
+                max_audio_prompt_seconds=10,
                 cfg_scale=cfg_scale,
                 temperature=temperature,
                 top_p=top_p,
+                cfg_filter_top_k=45,
                 speed_factor=speed_factor,
                 seed=seg_seed,
             )
