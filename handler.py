@@ -4,6 +4,10 @@ RunPod serverless handler for Dia 1.6B TTS.
 Accepts a list of dialogue segments, generates audio for each using Dia,
 concatenates them into a single MP3, and returns it as base64.
 
+Voice continuity: The last PROMPT_TAIL_SECONDS of each chunk's audio is
+passed as an audio_prompt to the next chunk, so Dia generates a consistent
+voice across the entire episode instead of picking random voices per chunk.
+
 Input format:
 {
     "segments": [
@@ -46,9 +50,38 @@ print("Model loaded and ready.")
 
 OUTPUT_SAMPLE_RATE = 44100
 
+# How many seconds of audio tail to use as voice prompt for the next chunk.
+# 10s gives Dia enough context to match voice timbre, pacing, and intonation.
+PROMPT_TAIL_SECONDS = 10
+
+
+def extract_tail_text(chunk_text, max_lines=3):
+    """Extract the last few lines of a chunk's text for audio_prompt_text.
+
+    Dia uses audio_prompt_text to align the audio prompt with what was said,
+    so we give it the transcript of the tail audio we're passing as prompt.
+    """
+    lines = [l for l in chunk_text.strip().split("\n") if l.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+def save_audio_prompt(audio_data, sample_rate):
+    """Save the tail of an audio chunk as a WAV file for use as audio_prompt."""
+    tail_samples = int(PROMPT_TAIL_SECONDS * sample_rate)
+    if len(audio_data) <= tail_samples:
+        # Chunk is shorter than prompt length — use the whole thing
+        tail_audio = audio_data
+    else:
+        tail_audio = audio_data[-tail_samples:]
+
+    prompt_path = tempfile.mktemp(suffix=".wav")
+    sf.write(prompt_path, tail_audio.astype(np.float32), sample_rate)
+    return prompt_path
+
 
 def handler(job):
     """Process a podcast episode generation job."""
+    prev_prompt_path = None
     try:
         input_data = job["input"]
 
@@ -73,8 +106,10 @@ def handler(job):
         # Sort segments by index
         segments = sorted(segments, key=lambda s: s.get("index", 0))
 
-        # Generate audio for each segment
+        # Generate audio for each segment, chaining voice via audio_prompt
         all_audio = []
+        prev_prompt_text = None  # Transcript of the tail audio
+        is_first_generation = True  # Track whether we've generated any audio yet
 
         for i, segment in enumerate(segments):
             seg_text = segment["text"]
@@ -83,16 +118,26 @@ def handler(job):
 
             print(f"Generating segment {i + 1}/{len(segments)}: {len(seg_text)} chars")
 
-            # Call the predict method from cog-dia's predict.py
-            # Must pass ALL optional params explicitly — cog.Input() defaults
-            # return FieldInfo objects (not None) when called outside Cog's HTTP server.
-            seg_seed = seed + i if seed is not None else None
+            # First generation: use seed to establish consistent voices.
+            # Subsequent: voice is anchored by the audio_prompt chain.
+            seg_seed = seed if (seed is not None and is_first_generation) else None
+
+            # Build audio_prompt args for voice continuity
+            audio_prompt_arg = None
+            audio_prompt_text_arg = None
+            prompt_seconds = PROMPT_TAIL_SECONDS
+
+            if prev_prompt_path is not None:
+                audio_prompt_arg = prev_prompt_path
+                audio_prompt_text_arg = prev_prompt_text
+                print(f"  Using {PROMPT_TAIL_SECONDS}s audio prompt from previous chunk")
+
             output_path = predictor.predict(
                 text=seg_text,
-                audio_prompt=None,
-                audio_prompt_text=None,
+                audio_prompt=audio_prompt_arg,
+                audio_prompt_text=audio_prompt_text_arg,
                 max_new_tokens=max_new_tokens,
-                max_audio_prompt_seconds=10,
+                max_audio_prompt_seconds=prompt_seconds,
                 cfg_scale=cfg_scale,
                 temperature=temperature,
                 top_p=top_p,
@@ -104,8 +149,24 @@ def handler(job):
             # Read the WAV output as numpy
             audio_data, sr = sf.read(str(output_path))
             all_audio.append(audio_data)
+            is_first_generation = False
 
-            # Clean up the temp WAV
+            # Clean up previous audio prompt temp file
+            if prev_prompt_path is not None:
+                try:
+                    os.unlink(prev_prompt_path)
+                except OSError:
+                    pass
+
+            # Save this chunk's tail as the audio prompt for the next chunk
+            if i < len(segments) - 1:
+                prev_prompt_path = save_audio_prompt(audio_data, sr)
+                prev_prompt_text = extract_tail_text(seg_text)
+            else:
+                prev_prompt_path = None
+                prev_prompt_text = None
+
+            # Clean up the output WAV
             try:
                 os.unlink(str(output_path))
             except OSError:
@@ -182,6 +243,12 @@ def handler(job):
         }
 
     except Exception as e:
+        # Clean up any lingering audio prompt temp file
+        if prev_prompt_path is not None:
+            try:
+                os.unlink(prev_prompt_path)
+            except OSError:
+                pass
         print(f"Handler error: {e}")
         import traceback
         traceback.print_exc()
